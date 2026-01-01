@@ -108,7 +108,7 @@ pub async fn post_messages(
                     None,
                 );
                 drop(tm_guard);
-                (std::sync::Arc::new(tokio::sync::Mutex::new(provider)), Some(id), acc_name, Some(pool.clone()))
+                (std::sync::Arc::new(provider), Some(id), acc_name, Some(pool.clone()))
             }
             None => {
                 tracing::error!("账号池中没有可用账号");
@@ -141,15 +141,7 @@ pub async fn post_messages(
     };
 
     // 获取 profile_arn
-    let profile_arn = if account_id.is_some() {
-        // 从账号池获取时，从 TokenManager 获取 profile_arn
-        let provider_guard = provider.lock().await;
-        // 暂时使用 state 中的 profile_arn
-        drop(provider_guard);
-        state.profile_arn.clone()
-    } else {
-        state.profile_arn.clone()
-    };
+    let profile_arn = state.profile_arn.clone();
 
     // 转换请求
     let conversion_result = match convert_request(&payload) {
@@ -215,7 +207,7 @@ pub async fn post_messages(
 
 /// 处理流式请求
 async fn handle_stream_request(
-    provider: std::sync::Arc<tokio::sync::Mutex<crate::kiro::provider::KiroProvider>>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -226,52 +218,49 @@ async fn handle_stream_request(
     start_time: std::time::Instant,
 ) -> Response {
     // 调用 Kiro API
-    let response = {
-        let mut provider_guard = provider.lock().await;
-        match provider_guard.call_api_stream(request_body).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let error_msg = e.to_string();
-                tracing::error!("Kiro API 调用失败: {}", error_msg);
+    let response = match provider.call_api_stream(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let error_msg = e.to_string();
+            tracing::error!("Kiro API 调用失败: {}", error_msg);
+            
+            // 记录错误到账号池
+            if let (Some(id), Some(pool)) = (&account_id, &pool) {
+                let is_rate_limit = error_msg.contains("429") || error_msg.contains("rate");
+                let is_suspended = error_msg.contains("suspended") || error_msg.contains("403");
                 
-                // 记录错误到账号池
-                if let (Some(id), Some(pool)) = (&account_id, &pool) {
-                    let is_rate_limit = error_msg.contains("429") || error_msg.contains("rate");
-                    let is_suspended = error_msg.contains("suspended") || error_msg.contains("403");
-                    
-                    if is_suspended {
-                        pool.mark_invalid(id).await;
-                        tracing::warn!("账号 {} 已被标记为失效（暂停）", id);
-                    } else {
-                        pool.record_error(id, is_rate_limit).await;
-                        tracing::warn!("账号 {} 记录错误，限流: {}", id, is_rate_limit);
-                    }
-                    
-                    // 记录失败的请求
-                    let log = crate::pool::RequestLog {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        account_id: id.clone(),
-                        account_name: account_name.clone(),
-                        model: model.to_string(),
-                        input_tokens,
-                        output_tokens: 0,
-                        success: false,
-                        error: Some(error_msg.clone()),
-                        timestamp: chrono::Utc::now(),
-                        duration_ms: start_time.elapsed().as_millis() as u64,
-                    };
-                    pool.add_request_log(log).await;
+                if is_suspended {
+                    pool.mark_invalid(id).await;
+                    tracing::warn!("账号 {} 已被标记为失效（暂停）", id);
+                } else {
+                    pool.record_error(id, is_rate_limit).await;
+                    tracing::warn!("账号 {} 记录错误，限流: {}", id, is_rate_limit);
                 }
                 
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(
-                        "api_error",
-                        format!("上游 API 调用失败: {}", e),
-                    )),
-                )
-                    .into_response();
+                // 记录失败的请求
+                let log = crate::pool::RequestLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    account_id: id.clone(),
+                    account_name: account_name.clone(),
+                    model: model.to_string(),
+                    input_tokens,
+                    output_tokens: 0,
+                    success: false,
+                    error: Some(error_msg.clone()),
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                };
+                pool.add_request_log(log).await;
             }
+            
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("上游 API 调用失败: {}", e),
+                )),
+            )
+                .into_response();
         }
     };
 
@@ -416,7 +405,7 @@ const CONTEXT_WINDOW_SIZE: i32 = 200_000;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
-    provider: std::sync::Arc<tokio::sync::Mutex<crate::kiro::provider::KiroProvider>>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
@@ -426,52 +415,49 @@ async fn handle_non_stream_request(
     start_time: std::time::Instant,
 ) -> Response {
     // 调用 Kiro API
-    let response = {
-        let mut provider_guard = provider.lock().await;
-        match provider_guard.call_api(request_body).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let error_msg = e.to_string();
-                tracing::error!("Kiro API 调用失败: {}", error_msg);
+    let response = match provider.call_api(request_body).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let error_msg = e.to_string();
+            tracing::error!("Kiro API 调用失败: {}", error_msg);
+            
+            // 记录错误到账号池
+            if let (Some(id), Some(pool)) = (&account_id, &pool) {
+                let is_rate_limit = error_msg.contains("429") || error_msg.contains("rate");
+                let is_suspended = error_msg.contains("suspended") || error_msg.contains("403");
                 
-                // 记录错误到账号池
-                if let (Some(id), Some(pool)) = (&account_id, &pool) {
-                    let is_rate_limit = error_msg.contains("429") || error_msg.contains("rate");
-                    let is_suspended = error_msg.contains("suspended") || error_msg.contains("403");
-                    
-                    if is_suspended {
-                        pool.mark_invalid(id).await;
-                        tracing::warn!("账号 {} 已被标记为失效（暂停）", id);
-                    } else {
-                        pool.record_error(id, is_rate_limit).await;
-                        tracing::warn!("账号 {} 记录错误，限流: {}", id, is_rate_limit);
-                    }
-                    
-                    // 记录失败的请求
-                    let log = crate::pool::RequestLog {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        account_id: id.clone(),
-                        account_name: account_name.clone(),
-                        model: model.to_string(),
-                        input_tokens,
-                        output_tokens: 0,
-                        success: false,
-                        error: Some(error_msg.clone()),
-                        timestamp: chrono::Utc::now(),
-                        duration_ms: start_time.elapsed().as_millis() as u64,
-                    };
-                    pool.add_request_log(log).await;
+                if is_suspended {
+                    pool.mark_invalid(id).await;
+                    tracing::warn!("账号 {} 已被标记为失效（暂停）", id);
+                } else {
+                    pool.record_error(id, is_rate_limit).await;
+                    tracing::warn!("账号 {} 记录错误，限流: {}", id, is_rate_limit);
                 }
                 
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(
-                        "api_error",
-                        format!("上游 API 调用失败: {}", e),
-                    )),
-                )
-                    .into_response();
+                // 记录失败的请求
+                let log = crate::pool::RequestLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    account_id: id.clone(),
+                    account_name: account_name.clone(),
+                    model: model.to_string(),
+                    input_tokens,
+                    output_tokens: 0,
+                    success: false,
+                    error: Some(error_msg.clone()),
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                };
+                pool.add_request_log(log).await;
             }
+            
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("上游 API 调用失败: {}", e),
+                )),
+            )
+                .into_response();
         }
     };
 

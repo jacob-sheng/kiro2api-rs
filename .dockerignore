@@ -1,0 +1,30 @@
+# 构建产物
+/target
+
+# 运行时数据（账号池、日志等）
+/data
+
+# 配置文件（敏感信息）
+/config.json
+/credentials.json
+.env
+
+# IDE 和编辑器
+/.idea
+/.vscode
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# Git
+.git
+.gitignore
+
+# 文档和测试
+/README.md
+/CLAUDE.md
+/AGENTS.md
+/test.json
+/*.example.json

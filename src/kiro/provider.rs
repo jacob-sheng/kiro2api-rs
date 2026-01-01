@@ -5,6 +5,7 @@
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
 use reqwest::Client;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::http_client::{build_client, ProxyConfig};
@@ -14,8 +15,9 @@ use crate::kiro::token_manager::TokenManager;
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
+/// 内部使用 Mutex 管理 TokenManager 状态，支持线程安全的并发访问
 pub struct KiroProvider {
-    token_manager: TokenManager,
+    token_manager: Mutex<TokenManager>,
     client: Client,
 }
 
@@ -31,35 +33,40 @@ impl KiroProvider {
             .expect("创建 HTTP 客户端失败");
 
         Self {
-            token_manager,
+            token_manager: Mutex::new(token_manager),
             client,
         }
     }
 
     /// 获取 API 基础 URL
-    pub fn base_url(&self) -> String {
+    pub async fn base_url(&self) -> String {
+        let tm = self.token_manager.lock().await;
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.token_manager.config().region
+            tm.config().region
         )
     }
 
     /// 获取 API 基础域名
-    pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().region)
+    pub async fn base_domain(&self) -> String {
+        let tm = self.token_manager.lock().await;
+        format!("q.{}.amazonaws.com", tm.config().region)
     }
 
     /// 构建请求头
-    fn build_headers(&self, token: &str) -> anyhow::Result<HeaderMap> {
-        let credentials = self.token_manager.credentials();
-        let config = self.token_manager.config();
+    async fn build_headers(&self, token: &str) -> anyhow::Result<HeaderMap> {
+        let tm = self.token_manager.lock().await;
+        let credentials = tm.credentials();
+        let config = tm.config();
 
         let machine_id = machine_id::generate_from_credentials(credentials, config)
             .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
 
-        let kiro_version = &config.kiro_version;
-        let os_name = &config.system_version;
-        let node_version = &config.node_version;
+        let kiro_version = config.kiro_version.clone();
+        let os_name = config.system_version.clone();
+        let node_version = config.node_version.clone();
+        let base_domain = format!("q.{}.amazonaws.com", config.region);
+        drop(tm); // 释放锁
 
         let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
 
@@ -84,7 +91,7 @@ impl KiroProvider {
             reqwest::header::USER_AGENT,
             HeaderValue::from_str(&user_agent).unwrap(),
         );
-        headers.insert(HOST, HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert(HOST, HeaderValue::from_str(&base_domain).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -109,10 +116,13 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&mut self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let token = self.token_manager.ensure_valid_token().await?;
-        let url = self.base_url();
-        let headers = self.build_headers(&token)?;
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+        let token = {
+            let mut tm = self.token_manager.lock().await;
+            tm.ensure_valid_token().await?
+        };
+        let url = self.base_url().await;
+        let headers = self.build_headers(&token).await?;
 
         let response = self
             .client
@@ -139,12 +149,15 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
     pub async fn call_api_stream(
-        &mut self,
+        &self,
         request_body: &str,
     ) -> anyhow::Result<reqwest::Response> {
-        let token = self.token_manager.ensure_valid_token().await?;
-        let url = self.base_url();
-        let headers = self.build_headers(&token)?;
+        let token = {
+            let mut tm = self.token_manager.lock().await;
+            tm.ensure_valid_token().await?
+        };
+        let url = self.base_url().await;
+        let headers = self.build_headers(&token).await?;
 
         let response = self
             .client
@@ -170,28 +183,29 @@ mod tests {
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
 
-    #[test]
-    fn test_base_url() {
+    #[tokio::test]
+    async fn test_base_url() {
         let config = Config::default();
         let credentials = KiroCredentials::default();
         let tm = TokenManager::new(config, credentials, None);
         let provider = KiroProvider::new(tm);
-        assert!(provider.base_url().contains("amazonaws.com"));
-        assert!(provider.base_url().contains("generateAssistantResponse"));
+        let url = provider.base_url().await;
+        assert!(url.contains("amazonaws.com"));
+        assert!(url.contains("generateAssistantResponse"));
     }
 
-    #[test]
-    fn test_base_domain() {
+    #[tokio::test]
+    async fn test_base_domain() {
         let mut config = Config::default();
         config.region = "us-east-1".to_string();
         let credentials = KiroCredentials::default();
         let tm = TokenManager::new(config, credentials, None);
         let provider = KiroProvider::new(tm);
-        assert_eq!(provider.base_domain(), "q.us-east-1.amazonaws.com");
+        assert_eq!(provider.base_domain().await, "q.us-east-1.amazonaws.com");
     }
 
-    #[test]
-    fn test_build_headers() {
+    #[tokio::test]
+    async fn test_build_headers() {
         let mut config = Config::default();
         config.region = "us-east-1".to_string();
         config.kiro_version = "0.8.0".to_string();
@@ -202,7 +216,7 @@ mod tests {
 
         let tm = TokenManager::new(config, credentials, None);
         let provider = KiroProvider::new(tm);
-        let headers = provider.build_headers("test_token").unwrap();
+        let headers = provider.build_headers("test_token").await.unwrap();
 
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(
