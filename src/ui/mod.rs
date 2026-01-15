@@ -203,11 +203,12 @@ async fn add_account(
 
     let account = Account::new(&id, req.name, credentials);
 
-    match state.pool.add_account(account).await {
+    // 使用带验证的添加方法，凭证无效则拒绝添加
+    match state.pool.add_account_with_validation(account).await {
         Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("凭证验证失败: {}", e)})),
         ),
     }
 }
@@ -256,11 +257,12 @@ async fn import_account(
 
     let account = Account::new(&id, name, credentials);
 
-    match state.pool.add_account(account).await {
+    // 使用带验证的添加方法，凭证无效则拒绝添加
+    match state.pool.add_account_with_validation(account).await {
         Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("凭证验证失败: {}", e)})),
         ),
     }
 }

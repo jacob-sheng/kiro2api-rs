@@ -167,6 +167,36 @@ impl AccountPool {
         Ok(())
     }
 
+    /// 验证凭证是否有效（尝试刷新 token）
+    ///
+    /// 返回 Ok(()) 表示凭证有效，Err 表示凭证无效
+    pub async fn validate_credentials(
+        &self,
+        credentials: &crate::kiro::model::credentials::KiroCredentials,
+    ) -> anyhow::Result<()> {
+        // 创建临时 TokenManager 进行验证
+        let mut token_manager =
+            TokenManager::new(self.config.clone(), credentials.clone(), self.proxy.clone());
+
+        // 尝试获取有效 token（会触发刷新）
+        token_manager.ensure_valid_token().await?;
+
+        Ok(())
+    }
+
+    /// 添加账号（带验证）
+    ///
+    /// 先验证凭证是否有效，有效才添加
+    pub async fn add_account_with_validation(&self, account: Account) -> anyhow::Result<()> {
+        // 先验证凭证
+        self.validate_credentials(&account.credentials).await?;
+
+        // 验证通过，添加账号
+        self.add_account_internal(account).await?;
+        self.save_to_file().await?;
+        Ok(())
+    }
+
     /// 移除账号
     pub async fn remove_account(&self, id: &str) -> Option<Account> {
         let mut accounts = self.accounts.write().await;
